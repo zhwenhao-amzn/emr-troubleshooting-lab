@@ -22,14 +22,6 @@ Spark job 提交後一直卡在 ACCEPTED 狀態，無法取得 YARN 資源執行
 - **CW Agent**: 透過 `emr-metrics` classification 啟用 YARN/HDFS/System metrics
 - **Spark Config**: 在 `spark-defaults` 和 Step args 雙重設定，確保 oversized request
 
-### CFN 踩坑紀錄
-
-| 問題 | 錯誤訊息 | 解法 |
-|------|----------|------|
-| EMR Configuration 屬性名稱 | `Encountered unsupported property Properties` | CFN 用 `ConfigurationProperties`，不是 EMR API 的 `Properties` |
-| 自建 Service Role 權限不足 | `Service role has insufficient EC2 permissions` | `AmazonEMRServicePolicy_v2` 設計給 service-linked role，自建 role 改用 `EMR_DefaultRole` |
-| Managed Policy ARN 缺 partition | ARN 解析失敗 | 用 `!Sub 'arn:${AWS::Partition}:iam::aws:policy/...'` |
-
 ## 部署方式
 
 ```bash
