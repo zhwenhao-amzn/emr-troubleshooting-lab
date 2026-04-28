@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Troubleshooting Lab - Scenario 02: Spark OOM
+  Submits a Spark job with tiny driver memory that collects large data to trigger driver OOM.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  LogBucket:
+    Type: String
+
+Resources:
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-ec2'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+
+  EMREC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-emr-ec2'
+      Roles:
+        - !Ref EMREC2Role
+
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub '${AWS::StackName}-spark-oom'
+      ReleaseLabel: emr-7.1.0
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+      ServiceRole: EMR_DefaultRole
+      JobFlowRole: !Ref EMREC2InstanceProfile
+      LogUri: !Sub 's3://${LogBucket}/emr-logs/'
+      VisibleToAllUsers: true
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Core
+        Ec2SubnetId: !Ref SubnetId
+      Configurations:
+        - Classification: emr-metrics
+          ConfigurationProperties: {}
+          Configurations:
+            - Classification: emr-system-metrics
+              ConfigurationProperties:
+                metrics_collection_interval: '30'
+              Configurations:
+                - Classification: mem
+                  ConfigurationProperties:
+                    metrics: mem_used_percent,mem_available_percent
+            - Classification: emr-hadoop-yarn-nodemanager-metrics
+              ConfigurationProperties:
+                'Hadoop:service=NodeManager,name=NodeManagerMetrics': >-
+                  ContainersRunning,ContainersFailed,AllocatedGB,AvailableGB
+              Configurations: []
+      Steps:
+        # Step 1: Upload PySpark OOM script to S3
+        - Name: UploadOOMScript
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - bash
+              - -c
+              - !Sub |
+                cat > /tmp/oom_job.py << 'PYEOF'
+                from pyspark.sql import SparkSession
+                import pyspark.sql.functions as F
+                spark = SparkSession.builder.appName("OOM-Test").getOrCreate()
+                df = spark.range(0, 50000000).select(
+                    F.col("id"),
+                    F.concat(F.lit("x" * 200), F.col("id").cast("string")).alias("payload")
+                )
+                result = df.collect()
+                print("Collected " + str(len(result)) + " rows")
+                spark.stop()
+                PYEOF
+                aws s3 cp /tmp/oom_job.py s3://${LogBucket}/emr-scripts/oom_job.py
+        # Step 2: Run with tiny driver memory — collect() triggers driver OOM
+        - Name: SparkDriverOOM
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --master
+              - yarn
+              - --deploy-mode
+              - cluster
+              - --conf
+              - spark.driver.memory=512m
+              - --conf
+              - spark.driver.maxResultSize=256m
+              - --conf
+              - spark.executor.memory=1g
+              - --conf
+              - spark.executor.instances=1
+              - --conf
+              - spark.dynamicAllocation.enabled=false
+              - !Sub 's3://${LogBucket}/emr-scripts/oom_job.py'
+
+Outputs:
+  ClusterId:
+    Description: EMR Cluster ID
+    Value: !Ref EMRCluster
+  TestPrompt:
+    Description: Prompt to test DevOps Agent
+    Value: !Sub >
+      Spark job failed with OutOfMemoryError on EMR cluster ${EMRCluster}.
+      The step shows FAILED status. Help me troubleshoot.
