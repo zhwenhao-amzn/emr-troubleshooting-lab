@@ -125,7 +125,7 @@ Agent 正確識別了 root cause：
 
 ## Demo 錄影
 
-📹 [demos/01-yarn-resource-exhaustion-test.mp4](demos/01-yarn-resource-exhaustion-test.mp4)
+https://github.com/zhwenhao-amzn/emr-troubleshooting-lab/raw/main/demos/01-yarn-resource-exhaustion-test.mp4
 
 ## 清理
 

@@ -108,7 +108,7 @@ Agent 正確識別：
 
 ## Demo 錄影
 
-📹 [demos/02-spark-oom-test.mp4](demos/02-spark-oom-test.mp4)
+https://github.com/zhwenhao-amzn/emr-troubleshooting-lab/raw/main/demos/02-spark-oom-test.mp4
 
 ## 清理
 
