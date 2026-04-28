@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Troubleshooting Lab - Scenario 01: YARN Resource Exhaustion
+  Creates a tiny EMR 7.x cluster with CloudWatch Agent metrics,
+  then submits a Spark job requesting more resources than available.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for EMR cluster
+  LogBucket:
+    Type: String
+    Description: S3 bucket for EMR logs
+
+Resources:
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-ec2'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+
+  EMREC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-emr-ec2'
+      Roles:
+        - !Ref EMREC2Role
+
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub '${AWS::StackName}-yarn-exhaustion'
+      ReleaseLabel: emr-7.1.0
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+      ServiceRole: EMR_DefaultRole
+      JobFlowRole: !Ref EMREC2InstanceProfile
+      LogUri: !Sub 's3://${LogBucket}/emr-logs/'
+      VisibleToAllUsers: true
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Core
+        Ec2SubnetId: !Ref SubnetId
+      Configurations:
+        - Classification: emr-metrics
+          ConfigurationProperties: {}
+          Configurations:
+            - Classification: emr-system-metrics
+              ConfigurationProperties:
+                metrics_collection_interval: '30'
+              Configurations:
+                - Classification: cpu
+                  ConfigurationProperties:
+                    metrics: cpu_usage_active,cpu_usage_idle,cpu_usage_iowait
+                - Classification: mem
+                  ConfigurationProperties:
+                    metrics: mem_used_percent,mem_available_percent
+                - Classification: disk
+                  ConfigurationProperties:
+                    metrics: disk_used_percent
+                    resources: '/,/mnt,/emr'
+            - Classification: emr-hadoop-yarn-resourcemanager-metrics
+              ConfigurationProperties:
+                'Hadoop:service=ResourceManager,name=QueueMetrics,q0=root': >-
+                  AvailableMB,AllocatedMB,PendingMB,AvailableVCores,AllocatedVCores,PendingVCores,PendingContainers,AllocatedContainers,ActiveApplications,AppsPending
+                'Hadoop:service=ResourceManager,name=ClusterMetrics': >-
+                  NumActiveNMs,NumDecommissionedNMs,NumLostNMs,NumUnhealthyNMs
+              Configurations: []
+            - Classification: emr-hadoop-yarn-nodemanager-metrics
+              ConfigurationProperties:
+                'Hadoop:service=NodeManager,name=NodeManagerMetrics': >-
+                  ContainersRunning,ContainersFailed,AllocatedGB,AvailableGB,AllocatedVCores,AvailableVCores
+              Configurations: []
+            - Classification: emr-hadoop-hdfs-namenode-metrics
+              ConfigurationProperties:
+                'Hadoop:service=NameNode,name=FSNamesystem': >-
+                  CapacityUsedGB,CapacityRemainingGB,CapacityTotalGB,BlocksTotal,UnderReplicatedBlocks,CorruptBlocks
+                'Hadoop:service=NameNode,name=NameNodeActivity': >-
+                  FilesCreated,FilesDeleted,CreateFileOps
+              Configurations: []
+            - Classification: emr-hadoop-hdfs-datanode-metrics
+              ConfigurationProperties:
+                'Hadoop:service=DataNode,name=FSDatasetState': >-
+                  Capacity,DfsUsed,Remaining
+              Configurations: []
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.executor.memory: '10g'
+            spark.executor.cores: '4'
+            spark.executor.instances: '5'
+            spark.dynamicAllocation.enabled: 'false'
+      Steps:
+        - Name: OverSizedSparkJob
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --class
+              - org.apache.spark.examples.SparkPi
+              - --master
+              - yarn
+              - --deploy-mode
+              - cluster
+              - --conf
+              - spark.executor.memory=10g
+              - --conf
+              - spark.executor.cores=4
+              - --conf
+              - spark.executor.instances=5
+              - --conf
+              - spark.dynamicAllocation.enabled=false
+              - /usr/lib/spark/examples/jars/spark-examples.jar
+              - '10000'
+
+Outputs:
+  ClusterId:
+    Description: EMR Cluster ID
+    Value: !Ref EMRCluster
+  TestPrompt:
+    Description: Prompt to test DevOps Agent
+    Value: !Sub >
+      My Spark job on EMR cluster ${EMRCluster} has been stuck in
+      ACCEPTED state for 30 minutes. No executors are launching. What's wrong?
+  CloudWatchNamespace:
+    Value: CWAgent
+  YARNMetricsDimension:
+    Value: service.name=hadoop
