@@ -108,7 +108,7 @@ Agent 正確識別：
 
 ## Demo 錄影
 
-<video src="demos/02-spark-oom-test.mp4" controls width="100%"></video>
+📹 [demos/02-spark-oom-test.mp4](demos/02-spark-oom-test.mp4)
 
 ## 清理
 
