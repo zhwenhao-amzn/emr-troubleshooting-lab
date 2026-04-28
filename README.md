@@ -9,7 +9,7 @@
 | 01 | [YARN Resource Exhaustion](01-yarn-resource-exhaustion.md) | 中階 | ✅ | ✅ 已測試 (24/25) |
 | 02 | [Spark OOM](02-spark-oom.md) | 中階 | ✅ | ✅ 已測試 (22/25) |
 | 03 | [Iceberg Small Files Problem](03-iceberg-small-files.md) | 中階 | ✅ | ✅ 已測試 (25/25) |
-| 04 | [Bootstrap Failure](04-bootstrap-failure.md) | 中階 | 🔲 | 待測 |
+| 04 | [Bootstrap Failure](04-bootstrap-failure.md) | 中階 | ✅ | ✅ 已測試 (25/25) |
 | 05 | [Spark Shuffle Failure](05-spark-shuffle-failure.md) | 進階 | 🔲 | 待測 |
 | 06 | [Spark Streaming MSK Lag](06-spark-streaming-msk-lag.md) | 進階 | 🔲 | 待測 |
 | 07 | [Iceberg Snapshot Expiration OOM](07-iceberg-snapshot-expiration-oom.md) | 進階 | 🔲 | 待測 |

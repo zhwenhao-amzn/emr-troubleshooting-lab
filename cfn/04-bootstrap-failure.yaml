@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Troubleshooting Lab - Scenario 04: Bootstrap Action Failure
+  Pre-req: upload bootstrap_install.sh to s3://<LogBucket>/emr-scripts/ before deploying.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  LogBucket:
+    Type: String
+
+Resources:
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-ec2'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+
+  EMREC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-emr-ec2'
+      Roles:
+        - !Ref EMREC2Role
+
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub '${AWS::StackName}-bootstrap-fail'
+      ReleaseLabel: emr-7.1.0
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+      ServiceRole: EMR_DefaultRole
+      JobFlowRole: !Ref EMREC2InstanceProfile
+      LogUri: !Sub 's3://${LogBucket}/emr-logs/'
+      VisibleToAllUsers: true
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Core
+        Ec2SubnetId: !Ref SubnetId
+      BootstrapActions:
+        - Name: InstallCustomPackages
+          ScriptBootstrapAction:
+            Path: !Sub 's3://${LogBucket}/emr-scripts/bootstrap_install.sh'
+
+Outputs:
+  ClusterId:
+    Description: EMR Cluster ID (will be TERMINATED_WITH_ERRORS)
+    Value: !Ref EMRCluster
+  TestPrompt:
+    Description: Prompt to test DevOps Agent
+    Value: !Sub >
+      My EMR cluster ${EMRCluster} terminated during startup with BOOTSTRAP_FAILURE.
+      How do I find what went wrong?
