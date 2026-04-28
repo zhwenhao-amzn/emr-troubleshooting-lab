@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Troubleshooting Lab - Scenario 03: Iceberg Small Files Problem
+  Creates Iceberg table via Glue Catalog, writes 100+ small appends, then runs a slow query.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  LogBucket:
+    Type: String
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-iceberg-data-${AWS::AccountId}'
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: emr_lab_03_iceberg_small_files_db
+        Description: Iceberg small files lab
+
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-ec2'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Policies:
+        - PolicyName: GlueAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:*
+                  - s3:*
+                Resource: '*'
+
+  EMREC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-emr-ec2'
+      Roles:
+        - !Ref EMREC2Role
+
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    DependsOn:
+      - GlueDatabase
+      - DataBucket
+    Properties:
+      Name: !Sub '${AWS::StackName}-iceberg-small-files'
+      ReleaseLabel: emr-7.1.0
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+      ServiceRole: EMR_DefaultRole
+      JobFlowRole: !Ref EMREC2InstanceProfile
+      LogUri: !Sub 's3://${LogBucket}/emr-logs/'
+      VisibleToAllUsers: true
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Core
+        Ec2SubnetId: !Ref SubnetId
+      Configurations:
+        - Classification: emr-metrics
+          ConfigurationProperties: {}
+          Configurations:
+            - Classification: emr-system-metrics
+              ConfigurationProperties:
+                metrics_collection_interval: '30'
+              Configurations:
+                - Classification: mem
+                  ConfigurationProperties:
+                    metrics: mem_used_percent,mem_available_percent
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.sql.catalog.glue_catalog: org.apache.iceberg.spark.SparkCatalog
+            spark.sql.catalog.glue_catalog.warehouse: !Sub 's3://${DataBucket}/warehouse/'
+            spark.sql.catalog.glue_catalog.catalog-impl: org.apache.iceberg.aws.glue.GlueCatalog
+            spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+            spark.jars.packages: org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,software.amazon.awssdk:bundle:2.25.11
+      Steps:
+        # Step 1: Upload PySpark scripts to S3
+        - Name: UploadScripts
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - bash
+              - -c
+              - !Sub |
+                cat > /tmp/create_and_flood.py << 'PYEOF'
+                from pyspark.sql import SparkSession
+                import pyspark.sql.functions as F
+
+                spark = SparkSession.builder \
+                    .appName("Iceberg-SmallFiles-Setup") \
+                    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+                    .config("spark.sql.catalog.glue_catalog.warehouse", "s3://${DataBucket}/warehouse/") \
+                    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+                    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+                    .getOrCreate()
+
+                db = "emr_lab_03_iceberg_small_files_db"
+
+                # Create Iceberg table
+                spark.sql(f"""
+                    CREATE TABLE IF NOT EXISTS glue_catalog.{db}.events (
+                        id BIGINT,
+                        event_time TIMESTAMP,
+                        user_id STRING,
+                        event_type STRING,
+                        payload STRING
+                    ) USING iceberg
+                    PARTITIONED BY (days(event_time))
+                    TBLPROPERTIES ('format-version'='2')
+                """)
+
+                # 120 small appends — each creates new data files + manifest
+                for i in range(120):
+                    df = spark.range(0, 50).select(
+                        F.col("id"),
+                        F.current_timestamp().alias("event_time"),
+                        F.concat(F.lit("user_"), (F.col("id") % 10).cast("string")).alias("user_id"),
+                        F.lit(f"batch_{i}").alias("event_type"),
+                        F.lit("x" * 100).alias("payload")
+                    )
+                    df.writeTo(f"glue_catalog.{db}.events").append()
+
+                print(f"Done: 120 appends, ~6000 rows in many small files")
+                spark.stop()
+                PYEOF
+
+                cat > /tmp/slow_query.py << 'PYEOF2'
+                from pyspark.sql import SparkSession
+                import time
+
+                spark = SparkSession.builder \
+                    .appName("Iceberg-SlowQuery") \
+                    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+                    .config("spark.sql.catalog.glue_catalog.warehouse", "s3://${DataBucket}/warehouse/") \
+                    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+                    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+                    .getOrCreate()
+
+                db = "emr_lab_03_iceberg_small_files_db"
+
+                start = time.time()
+                result = spark.sql(f"""
+                    SELECT event_type, count(*) as cnt, count(distinct user_id) as users
+                    FROM glue_catalog.{db}.events
+                    GROUP BY event_type
+                    ORDER BY cnt DESC
+                """)
+                result.show(10)
+                elapsed = time.time() - start
+                print(f"Query took {elapsed:.1f} seconds")
+
+                # Show table metadata
+                spark.sql(f"SELECT * FROM glue_catalog.{db}.events.snapshots").show(5, False)
+                spark.sql(f"SELECT * FROM glue_catalog.{db}.events.files").show(5, False)
+                file_count = spark.sql(f"SELECT count(*) FROM glue_catalog.{db}.events.files").collect()[0][0]
+                print(f"Total data files: {file_count}")
+                spark.stop()
+                PYEOF2
+
+                aws s3 cp /tmp/create_and_flood.py s3://${LogBucket}/emr-scripts/create_and_flood.py
+                aws s3 cp /tmp/slow_query.py s3://${LogBucket}/emr-scripts/slow_query.py
+        # Step 2: Create table + 120 small appends
+        - Name: FloodSmallFiles
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --master
+              - yarn
+              - --deploy-mode
+              - cluster
+              - --conf
+              - spark.driver.memory=2g
+              - --conf
+              - spark.executor.memory=2g
+              - --conf
+              - spark.executor.instances=1
+              - --conf
+              - spark.dynamicAllocation.enabled=false
+              - !Sub 's3://${LogBucket}/emr-scripts/create_and_flood.py'
+        # Step 3: Run slow query on fragmented table
+        - Name: SlowQueryOnSmallFiles
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --master
+              - yarn
+              - --deploy-mode
+              - cluster
+              - --conf
+              - spark.driver.memory=2g
+              - --conf
+              - spark.executor.memory=2g
+              - --conf
+              - spark.executor.instances=1
+              - --conf
+              - spark.dynamicAllocation.enabled=false
+              - !Sub 's3://${LogBucket}/emr-scripts/slow_query.py'
+
+Outputs:
+  ClusterId:
+    Description: EMR Cluster ID
+    Value: !Ref EMRCluster
+  DataBucket:
+    Description: S3 bucket with Iceberg data
+    Value: !Ref DataBucket
+  GlueDatabase:
+    Description: Glue database name
+    Value: emr_lab_03_iceberg_small_files_db
+  TestPrompt:
+    Description: Prompt to test DevOps Agent
+    Value: !Sub >
+      My Spark query on Iceberg table is extremely slow on EMR cluster ${EMRCluster}.
+      It used to take 30 seconds but now takes over 10 minutes. The table is in
+      Glue database emr_lab_03_iceberg_small_files_db. Help me troubleshoot.
