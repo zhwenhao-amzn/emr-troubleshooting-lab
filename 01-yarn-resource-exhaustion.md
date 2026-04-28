@@ -123,6 +123,10 @@ Agent 正確識別了 root cause：
 ### 改進空間
 - 未主動查看 S3 上的 Spark driver/executor log 來佐證分析
 
+## Demo 錄影
+
+📹 [demos/01-yarn-resource-exhaustion-test.mp4](demos/01-yarn-resource-exhaustion-test.mp4)
+
 ## 清理
 
 ```bash

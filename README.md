@@ -53,12 +53,6 @@ aws cloudformation describe-stacks \
 - Spark metrics: dimension `ApplicationID`
 - System metrics: `cpu_*`, `mem_*`, `disk_*`
 
-## Demo 錄影
-
-| 場景 | 影片 |
-|------|------|
-| 01 - YARN Resource Exhaustion | [demos/01-yarn-resource-exhaustion-test.mp4](demos/01-yarn-resource-exhaustion-test.mp4) |
-
 ## 清理
 
 ```bash
