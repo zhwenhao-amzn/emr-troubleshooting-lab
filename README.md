@@ -13,7 +13,7 @@
 | 05 | [Spark Shuffle Failure](05-spark-shuffle-failure.md) | 進階 | 🔲 | 待測 |
 | 06 | [Spark Streaming MSK Lag](06-spark-streaming-msk-lag.md) | 進階 | 🔲 | 待測 |
 | 07 | [Iceberg Snapshot Expiration OOM](07-iceberg-snapshot-expiration-oom.md) | 進階 | ✅ | ✅ 已測試 (24/25) |
-| 08 | [Iceberg Schema Evolution 衝突](08-iceberg-schema-evolution-conflict.md) | 中階 | ✅ | 待測 |
+| 08 | [Iceberg Schema Evolution 衝突](08-iceberg-schema-evolution-conflict.md) | 中階 | ✅ | ✅ 已測試 (24/25) |
 | 09 | [Iceberg Concurrent Write Conflict](09-iceberg-concurrent-write-conflict.md) | 進階 | ✅ | 待測 |
 
 ## 架構
