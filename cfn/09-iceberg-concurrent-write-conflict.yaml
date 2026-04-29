@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Troubleshooting Lab - Scenario 09: Iceberg Concurrent Write Conflict
+  Spawns 3 concurrent threads writing to the same Iceberg table to trigger CommitFailedException.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  LogBucket:
+    Type: String
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-iceberg-data-${AWS::AccountId}'
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: emr_lab_09_iceberg_concurrent_write_db
+        Description: Iceberg concurrent write conflict lab
+
+  EMREC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-emr-ec2'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Policies:
+        - PolicyName: GlueAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:*
+                  - s3:*
+                Resource: '*'
+
+  EMREC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-emr-ec2'
+      Roles:
+        - !Ref EMREC2Role
+
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    DependsOn:
+      - GlueDatabase
+      - DataBucket
+    Properties:
+      Name: !Sub '${AWS::StackName}-iceberg-concurrent-write'
+      ReleaseLabel: emr-7.1.0
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+      ServiceRole: EMR_DefaultRole
+      JobFlowRole: !Ref EMREC2InstanceProfile
+      LogUri: !Sub 's3://${LogBucket}/emr-logs/'
+      VisibleToAllUsers: true
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Core
+        Ec2SubnetId: !Ref SubnetId
+      Configurations:
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.sql.catalog.glue_catalog: org.apache.iceberg.spark.SparkCatalog
+            spark.sql.catalog.glue_catalog.warehouse: !Sub 's3://${DataBucket}/warehouse/'
+            spark.sql.catalog.glue_catalog.catalog-impl: org.apache.iceberg.aws.glue.GlueCatalog
+            spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+            spark.jars.packages: org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,software.amazon.awssdk:bundle:2.25.11
+      Steps:
+        - Name: UploadScripts
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - bash
+              - -c
+              - !Sub |
+                cat > /tmp/create_table.py << 'PYEOF'
+                from pyspark.sql import SparkSession
+
+                spark = SparkSession.builder.appName("Iceberg-CreateTable").getOrCreate()
+                db = "emr_lab_09_iceberg_concurrent_write_db"
+
+                spark.sql(f"""
+                    CREATE TABLE IF NOT EXISTS glue_catalog.{db}.events (
+                        id BIGINT,
+                        event_time TIMESTAMP,
+                        source STRING,
+                        data STRING
+                    ) USING iceberg
+                    TBLPROPERTIES (
+                        'format-version'='2',
+                        'commit.retry.num-retries'='1',
+                        'commit.retry.min-wait-ms'='0'
+                    )
+                """)
+
+                # Write initial seed data
+                from pyspark.sql import functions as F
+                spark.range(0, 100).select(
+                    F.col("id"),
+                    F.current_timestamp().alias("event_time"),
+                    F.lit("seed").alias("source"),
+                    F.lit("init").alias("data")
+                ).writeTo(f"glue_catalog.{db}.events").append()
+
+                print("Table created with seed data")
+                spark.stop()
+                PYEOF
+
+                cat > /tmp/concurrent_write.py << 'PYEOF2'
+                from pyspark.sql import SparkSession
+                from pyspark.sql import functions as F
+                import threading, time, traceback
+
+                spark = SparkSession.builder.appName("Iceberg-ConcurrentWrite").getOrCreate()
+                db = "emr_lab_09_iceberg_concurrent_write_db"
+                results = {}
+
+                def writer(thread_id, iterations=8):
+                    try:
+                        for i in range(iterations):
+                            df = spark.range(0, 50).select(
+                                (F.col("id") + thread_id * 10000 + i * 100).alias("id"),
+                                F.current_timestamp().alias("event_time"),
+                                F.lit(f"thread_{thread_id}").alias("source"),
+                                F.lit(f"iter_{i}").alias("data")
+                            )
+                            df.writeTo(f"glue_catalog.{db}.events").append()
+                            print(f"Thread {thread_id} append {i} OK")
+                        results[thread_id] = "SUCCESS"
+                    except Exception as e:
+                        print(f"Thread {thread_id} FAILED: {e}")
+                        traceback.print_exc()
+                        results[thread_id] = f"FAILED: {e}"
+
+                threads = []
+                for tid in range(3):
+                    t = threading.Thread(target=writer, args=(tid,))
+                    threads.append(t)
+
+                # Start all threads simultaneously
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+                print("\n=== RESULTS ===")
+                for tid, status in sorted(results.items()):
+                    print(f"Thread {tid}: {status}")
+
+                spark.stop()
+                PYEOF2
+
+                aws s3 cp /tmp/create_table.py s3://${LogBucket}/emr-scripts/09/create_table.py
+                aws s3 cp /tmp/concurrent_write.py s3://${LogBucket}/emr-scripts/09/concurrent_write.py
+
+        - Name: CreateTableAndSeed
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --master
+              - yarn
+              - --deploy-mode
+              - cluster
+              - --conf
+              - spark.driver.memory=2g
+              - --conf
+              - spark.executor.memory=2g
+              - --conf
+              - spark.executor.instances=1
+              - --conf
+              - spark.dynamicAllocation.enabled=false
+              - !Sub 's3://${LogBucket}/emr-scripts/09/create_table.py'
+
+        - Name: ConcurrentWriteConflict
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --master
+              - yarn
+              - --deploy-mode
+              - cluster
+              - --conf
+              - spark.driver.memory=2g
+              - --conf
+              - spark.executor.memory=2g
+              - --conf
+              - spark.executor.instances=1
+              - --conf
+              - spark.dynamicAllocation.enabled=false
+              - !Sub 's3://${LogBucket}/emr-scripts/09/concurrent_write.py'
+
+Outputs:
+  ClusterId:
+    Description: EMR Cluster ID
+    Value: !Ref EMRCluster
+  DataBucket:
+    Description: S3 bucket with Iceberg data
+    Value: !Ref DataBucket
+  GlueDatabase:
+    Description: Glue database name
+    Value: emr_lab_09_iceberg_concurrent_write_db
+  TestPrompt:
+    Description: Prompt to test DevOps Agent
+    Value: !Sub >
+      Some of my Spark jobs writing to the same Iceberg table are failing with
+      CommitFailedException on EMR cluster ${EMRCluster}. Not all jobs fail,
+      just some. The table is in Glue database emr_lab_09_iceberg_concurrent_write_db.
