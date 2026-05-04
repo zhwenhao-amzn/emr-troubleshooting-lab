@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EMR Cluster with Spark Data Skew Simulation Job.
+  Uploads PySpark script via Lambda-backed Custom Resource,
+  then creates EMR cluster and submits the skew demo Step.
+
+Parameters:
+
+  S3BucketName:
+    Type: String
+    Description: "Existing S3 bucket for EMR logs and scripts. Must already exist in the same region."
+    AllowedPattern: "^[a-z0-9][a-z0-9\\-\\.]{1,61}[a-z0-9]$"
+    ConstraintDescription: >
+      REQUIRED: Please provide your existing S3 bucket name.
+      Example: my-emr-logs-bucket-123456789
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "EC2 Key Pair for EMR master node SSH access."
+    ConstraintDescription: >
+      REQUIRED: Please select an existing EC2 Key Pair from your account.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet ID where EMR cluster nodes will be launched."
+    ConstraintDescription: >
+      REQUIRED: Please select an existing Subnet ID from your VPC.
+
+  ReleaseLabel:
+    Type: String
+    Default: "emr-7.13.0"
+
+  MasterInstanceType:
+    Type: String
+    Default: "m7g.2xlarge"
+
+  CoreInstanceType:
+    Type: String
+    Default: "m7g.2xlarge"
+
+  CoreInstanceCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+
+Resources:
+
+  # -----------------------------------------------------------
+  # 1. IAM Role for Lambda
+  # -----------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-s3-upload-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PutScript
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+
+  # -----------------------------------------------------------
+  # 2. Lambda Function
+  #    SCRIPT_B64 用單行字串賦值，完全避開 YAML 解析問題
+  # -----------------------------------------------------------
+  ScriptUploaderFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-script-uploader"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import base64
+          import cfnresponse
+
+          SCRIPT_B64 = "ZnJvbSBweXNwYXJrLnNxbCBpbXBvcnQgU3BhcmtTZXNzaW9uCmZyb20gcHlzcGFyay5zcWwgaW1wb3J0IGZ1bmN0aW9ucyBhcyBGCmZyb20gcHlzcGFyay5zcWwudHlwZXMgaW1wb3J0IFN0cnVjdFR5cGUsIFN0cnVjdEZpZWxkLCBTdHJpbmdUeXBlLCBMb25nVHlwZQppbXBvcnQgdGltZQoKc3BhcmsgPSBTcGFya1Nlc3Npb24uYnVpbGRlciBcCiAgICAuYXBwTmFtZSgiRGF0YXNrZXdEZW1vIikgXAogICAgLmNvbmZpZygic3Bhcmsuc3FsLnNodWZmbGUucGFydGl0aW9ucyIsICIxMCIpIFwKICAgIC5jb25maWcoInNwYXJrLnNxbC5hZGFwdGl2ZS5lbmFibGVkIiwgImZhbHNlIikgXAogICAgLmNvbmZpZygic3BhcmsuZXhlY3V0b3IubWVtb3J5IiwgIjhnIikgXAogICAgLmNvbmZpZygic3BhcmsuZHJpdmVyLm1lbW9yeSIsICI0ZyIpIFwKICAgIC5jb25maWcoInNwYXJrLmV4ZWN1dG9yLmNvcmVzIiwgIjQiKSBcCiAgICAuZ2V0T3JDcmVhdGUoKQoKc2MgPSBzcGFyay5zcGFya0NvbnRleHQKc2Muc2V0TG9nTGV2ZWwoIldBUk4iKQoKcHJpbnQoIj0iICogNjApCnByaW50KCIgU3BhcmsgRGF0YSBTa2V3IFNpbXVsYXRpb24gLSBzdHJhZ2dsZXIgdGFzayBkZW1vIikKcHJpbnQoIj0iICogNjApCgpUT1RBTF9SRUNPUkRTID0gNTAwXzAwMF8wMDAKSE9UX0tFWV9SQVRJTyA9IDAuOTkKaG90X2NvdW50ICAgID0gaW50KFRPVEFMX1JFQ09SRFMgKiBIT1RfS0VZX1JBVElPKQpub3JtYWxfY291bnQgPSBUT1RBTF9SRUNPUkRTIC0gaG90X2NvdW50CgpwcmludChmIltHZW5lcmF0ZV0gVG90YWwgcmVjb3JkcyAgICAgIDoge1RPVEFMX1JFQ09SRFM6LH0iKQpwcmludChmIltHZW5lcmF0ZV0gaG90X2tleSAgICAgICAgICAgIDoge2hvdF9jb3VudDosfSAoe0hPVF9LRVlfUkFUSU8qMTAwOi4wZn0lKSIpCnByaW50KGYiW0dlbmVyYXRlXSBrZXlfMDAxfjAwOSAgICAgICAgOiB7bm9ybWFsX2NvdW50Oix9ICh7KDEtSE9UX0tFWV9SQVRJTykqMTAwOi4wZn0lKSIpCnByaW50KGYiW0dlbmVyYXRlXSBBUUUgICAgICAgICAgICAgICAgOiBESVNBQkxFRCIpCnByaW50KGYiW0dlbmVyYXRlXSBzaHVmZmxlLnBhcnRpdGlvbnMgOiAxMCIpCgpob3RfcmRkID0gc2MucmFuZ2UoMCwgaG90X2NvdW50KS5tYXAoCiAgICBsYW1iZGEgeDogKCJob3Rfa2V5IiwgeCwgInBheWxvYWRfIiArICJYIiAqIDEwMDApCikKbm9ybWFsX3JkZCA9IHNjLnJhbmdlKDAsIG5vcm1hbF9jb3VudCkubWFwKAogICAgbGFtYmRhIHg6IChmImtleV97KHggJSA5KSArIDE6MDNkfSIsIHgsICJwYXlsb2FkXyIgKyAiWSIgKiAxMDAwKQopCgpzY2hlbWEgPSBTdHJ1Y3RUeXBlKFsKICAgIFN0cnVjdEZpZWxkKCJqb2luX2tleSIsICBTdHJpbmdUeXBlKCksIEZhbHNlKSwKICAgIFN0cnVjdEZpZWxkKCJyZWNvcmRfaWQiLCBMb25nVHlwZSgpLCAgIEZhbHNlKSwKICAgIFN0cnVjdEZpZWxkKCJwYXlsb2FkIiwgICBTdHJpbmdUeXBlKCksIEZhbHNlKSwKXSkKCnNrZXdlZF9kZiA9IHNwYXJrLmNyZWF0ZURhdGFGcmFtZShob3RfcmRkLnVuaW9uKG5vcm1hbF9yZGQpLCBzY2hlbWEpCnNrZXdlZF9kZi5jYWNoZSgpCgpwcmludCgiW0dlbmVyYXRlXSBDYWNoaW5nIGRhdGFzZXQuLi4iKQp0b3RhbCA9IHNrZXdlZF9kZi5jb3VudCgpCnByaW50KGYiW0dlbmVyYXRlXSBDYWNoZWQge3RvdGFsOix9IHJlY29yZHMgc3VjY2Vzc2Z1bGx5LiIpCnByaW50KCJbU2tldyBKb2JdIFN0YXJ0aW5nIHNrZXdlZCBhZ2dyZWdhdGlvbiAoQVFFPU9GRikuLi4iKQoKc3RhcnQgPSB0aW1lLnRpbWUoKQoKc2tld2VkX2RmIFwKICAgIC5ncm91cEJ5KCJqb2luX2tleSIpIFwKICAgIC5hZ2coCiAgICAgICAgRi5jb3VudCgiKiIpLmFsaWFzKCJ0b3RhbF9jb3VudCIpLAogICAgICAgIEYuc3VtKCJyZWNvcmRfaWQiKS5hbGlhcygic3VtX2lkIiksCiAgICAgICAgRi5hdmcoInJlY29yZF9pZCIpLmFsaWFzKCJhdmdfaWQiKSwKICAgICAgICBGLm1heCgicmVjb3JkX2lkIikuYWxpYXMoIm1heF9pZCIpLAogICAgICAgIEYubWluKCJyZWNvcmRfaWQiKS5hbGlhcygibWluX2lkIikKICAgICkgXAogICAgLndyaXRlIFwKICAgIC5tb2RlKCJvdmVyd3JpdGUiKSBcCiAgICAucGFycXVldCgiaGRmczovLy90bXAvc2tld19vdXRwdXQiKQoKZHVyYXRpb24gPSB0aW1lLnRpbWUoKSAtIHN0YXJ0CgpwcmludCgiPSIgKiA2MCkKcHJpbnQoZiIgIEFnZ3JlZ2F0aW9uIGNvbXBsZXRlZCBpbiB7ZHVyYXRpb246LjFmfXMiKQpwcmludCggIiAgT3V0cHV0OiBoZGZzOi8vL3RtcC9za2V3X291dHB1dCIpCnByaW50KCAiICBWZXJpZnkgaW4gU3BhcmsgSGlzdG9yeSBTZXJ2ZXI6IikKcHJpbnQoICIgIC0+IFN0YWdlcyAtPiBHcm91cEJ5K1dyaXRlIHN0YWdlIikKcHJpbnQoICIgIC0+IFRhc2tzIC0+IER1cmF0aW9uOiAxIHN0cmFnZ2xlciA+PiBvdGhlcnMiKQpwcmludCggIiAgLT4gU2h1ZmZsZSBSZWFkOiBob3Rfa2V5IHRhc2sgaG9sZHMgfjk5JSBvZiBkYXRhIikKcHJpbnQoIj0iICogNjApCgpzcGFyay5zdG9wKCkK"
+
+          def parse_s3_uri(uri):
+              for scheme in ("s3a://", "s3://"):
+                  if uri.startswith(scheme):
+                      without_scheme = uri[len(scheme):]
+                      parts = without_scheme.split("/", 1)
+                      bucket = parts[0]
+                      prefix = (parts[1].lstrip("/") if len(parts) > 1 else "")
+                      if prefix and not prefix.endswith("/"):
+                          prefix += "/"
+                      return bucket, prefix
+              raise ValueError("Unsupported URI scheme: " + uri)
+
+          def ensure_s3_prefix(s3_client, uri):
+              bucket, prefix = parse_s3_uri(uri)
+              if not prefix:
+                  print("[Skip] URI has no prefix (bucket root): " + uri)
+                  return
+              resp = s3_client.list_objects_v2(
+                  Bucket=bucket, Prefix=prefix, MaxKeys=1
+              )
+              if resp.get("KeyCount", 0) > 0:
+                  print("[Exists] s3://" + bucket + "/" + prefix)
+              else:
+                  placeholder_key = prefix + ".placeholder"
+                  s3_client.put_object(
+                      Bucket=bucket,
+                      Key=placeholder_key,
+                      Body=b"",
+                      ContentType="application/x-directory"
+                  )
+                  print("[Created] s3://" + bucket + "/" + placeholder_key)
+
+          def handler(event, context):
+              print("[Lambda] RequestType: " + event["RequestType"])
+              s3       = boto3.client("s3")
+              props    = event["ResourceProperties"]
+              bucket   = props["Bucket"]
+              key      = props["Key"]
+              req_type = event["RequestType"]
+              try:
+                  if req_type in ("Create", "Update"):
+                      for dir_uri in props.get("EnsureS3Prefixes", []):
+                          print("[Check] Ensuring prefix exists: " + dir_uri)
+                          ensure_s3_prefix(s3, dir_uri)
+                      script_bytes = base64.b64decode(SCRIPT_B64)
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=script_bytes,
+                          ContentType="text/x-python"
+                      )
+                      print("[OK] Uploaded s3://" + bucket + "/" + key)
+                  elif req_type == "Delete":
+                      s3.delete_object(Bucket=bucket, Key=key)
+                      print("[OK] Deleted s3://" + bucket + "/" + key)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"ScriptS3Uri": "s3://" + bucket + "/" + key})
+              except Exception as e:
+                  print("[ERROR] " + str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {"Message": str(e)})
+
+  # -----------------------------------------------------------
+  # 3. Custom Resource
+  # -----------------------------------------------------------
+  SparkScriptUploader:
+    Type: Custom::S3ScriptUploader
+    DependsOn: ScriptUploaderFunction
+    Properties:
+      ServiceToken: !GetAtt ScriptUploaderFunction.Arn
+      Bucket: !Ref S3BucketName
+      Key: "scripts/spark_skew_demo.py"
+      EnsureS3Prefixes:
+        - !Sub "s3a://${S3BucketName}/emr-logs/spark-event-logs/"
+        - !Sub "s3a://${S3BucketName}/emr-logs/"
+        - !Sub "s3a://${S3BucketName}/scripts/"
+
+  # -----------------------------------------------------------
+  # 4. EMR Cluster
+  # -----------------------------------------------------------
+  DataSkewEMRCluster:
+    Type: AWS::EMR::Cluster
+    DependsOn: SparkScriptUploader
+    Properties:
+      Name: !Sub "DataSkewSimulation-${AWS::StackName}"
+      ReleaseLabel: !Ref ReleaseLabel
+      LogUri: !Sub "s3://${S3BucketName}/emr-logs/"
+      Applications:
+        - Name: Hadoop
+        - Name: Spark
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: !Ref MasterInstanceType
+          Market: ON_DEMAND
+          Name: Master
+        CoreInstanceGroup:
+          InstanceCount: !Ref CoreInstanceCount
+          InstanceType: !Ref CoreInstanceType
+          Market: ON_DEMAND
+          Name: Core
+        Ec2KeyName: !Ref KeyName
+        Ec2SubnetId: !Ref SubnetId
+      ServiceRole: "arn:aws:iam::263694178707:role/EMR_DefaultRole"
+      JobFlowRole: "EMR_EC2_DefaultRole"
+      VisibleToAllUsers: true
+      Tags:
+        - Key: Purpose
+          Value: Simulation
+        - Key: Type
+          Value: DataSkew
+      Configurations:
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.sql.shuffle.partitions: "200"
+            spark.sql.adaptive.enabled: "false"
+            spark.executor.memory: "6g"
+            spark.driver.memory: "4g"
+            spark.executor.cores: "4"
+            spark.eventLog.enabled: "true"
+            spark.history.fs.logDirectory: !Sub "s3a://${S3BucketName}/emr-logs/spark-event-logs/"
+            spark.eventLog.dir: !Sub "s3a://${S3BucketName}/emr-logs/spark-event-logs/"
+
+  # -----------------------------------------------------------
+  # 5. EMR Step - Spark Data Skew Job
+  # -----------------------------------------------------------
+  DataSkewSparkStep:
+    Type: AWS::EMR::Step
+    DependsOn: DataSkewEMRCluster
+    Properties:
+      Name: SparkDataSkewDemo
+      JobFlowId: !Ref DataSkewEMRCluster
+      ActionOnFailure: CONTINUE
+      HadoopJarStep:
+        Jar: command-runner.jar
+        Args:
+          - spark-submit
+          - --deploy-mode
+          - cluster
+          - --conf
+          - spark.sql.adaptive.enabled=false
+          - --conf
+          - spark.sql.shuffle.partitions=10
+          - --conf
+          - spark.executor.memory=6g
+          - --conf
+          - spark.driver.memory=4g
+          - !Sub "s3://${S3BucketName}/scripts/spark_skew_demo.py"
+
+Outputs:
+
+  ClusterId:
+    Description: "EMR Cluster ID"
+    Value: !Ref DataSkewEMRCluster
+
+  StepId:
+    Description: "EMR Step ID for the Skew Demo job"
+    Value: !Ref DataSkewSparkStep
+
+  ScriptS3Uri:
+    Description: "PySpark script location on S3"
+    Value: !Sub "s3://${S3BucketName}/scripts/spark_skew_demo.py"
+
+  LogUri:
+    Description: "EMR log location on S3"
+    Value: !Sub "s3://${S3BucketName}/emr-logs/"
+
+  SparkEventLogUri:
+    Description: "Spark event log directory on S3"
+    Value: !Sub "s3://${S3BucketName}/emr-logs/spark-event-logs/"
+
+  TerminateCommand:
+    Description: "CLI command to terminate the cluster after testing"
+    Value: !Sub "aws emr terminate-clusters --cluster-ids ${DataSkewEMRCluster} --region ap-northeast-1"
+
+  SparkHistoryServerNote:
+    Description: "How to verify data skew in Spark History Server"
+    Value: >
+      SSH tunnel: ssh -i <key.pem> -N -L 18080:localhost:18080 hadoop@<master-dns>
+      Then open: http://localhost:18080
+      -> App: DataskewDemo -> Stages -> GroupBy stage
+      -> Tasks -> Duration: hot_key task >> all others
+      -> Shuffle Read Size: hot_key task holds ~99% of data
