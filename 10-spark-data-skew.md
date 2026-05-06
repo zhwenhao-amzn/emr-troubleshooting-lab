@@ -1,7 +1,7 @@
 # Scenario 10: Spark Data Skew — Straggler Task
 
 ## 問題描述
-Spark job 在 `groupBy` 聚合階段出現嚴重的 data skew，99% 的資料集中在單一 key（`hot_key`），導致一個 task 處理時間遠超其他 task（straggler），整體 job 效能極差。AQE（Adaptive Query Execution）被刻意關閉，無法自動緩解 skew。
+Spark job 在 `groupBy` 聚合階段出現嚴重的 data skew，99% 的資料集中在單一 key（`hot_key`），導致少數 task 處理時間遠超其他 task（straggler），整體 job 效能極差。AQE（Adaptive Query Execution）被刻意關閉，無法自動緩解 skew。
 
 ## 架構設計
 
@@ -85,41 +85,65 @@ ssh -i <key.pem> -N -L 18080:localhost:18080 hadoop@<master-dns>
 
 ## 預期症狀
 
-- Step `SparkDataSkewDemo` 狀態 **COMPLETED**（job 不會失敗，但耗時極長）
+- Step `SparkDataSkewDemo` 狀態 **COMPLETED**（job 不會失敗，但耗時極長 ~9.4 分鐘）
 - Spark History Server 中可觀察到：
-  - GroupBy stage 的 10 個 task 中，1 個 task 耗時遠超其他 9 個
-  - Straggler task 的 Shuffle Read Size 佔整體 ~99%
-  - 其他 9 個 task 很快完成，整個 stage 被 1 個 task 拖住
-- Driver log 輸出：`Aggregation completed in XXXs`（預期數分鐘）
-- Executor metrics：1 個 executor 的 CPU/Memory 持續高負載，其他 executor 閒置
+  - GroupBy stage 有 4 個 task（shuffle.partitions=10，但 key 只有 10 個，hash 分佈到 4 個有效 partition）
+  - Task 0/1 各處理 ~2.475 億筆 `hot_key` 資料，耗時 ~534 秒
+  - Task 2/3 處理 ~250 萬筆 normal key 資料，耗時僅 ~10 秒
+  - 任務時長傾斜比：**53.5 倍** 🔴
+  - 2/3 的 Executor 核心閒置超過 8 分鐘
+- Driver log 輸出：`Aggregation completed in ~566s`
+- 集群資源利用率嚴重不足（75% 時間處於閒置）
 
 ## Spark History Server 觀察重點
 
 | 觀察項目 | 位置 | 預期異常值 |
 |----------|------|-----------|
-| Stage Duration | Stages tab → GroupBy stage | 整體耗時被 straggler 拖長 |
-| Task Duration 分佈 | Stage detail → Tasks | 1 個 task >> 其他 9 個 |
-| Shuffle Read Size | Stage detail → Tasks → Shuffle Read | hot_key task ~495GB vs 其他 ~0.5GB |
-| Task Skew | Stage detail → Summary Metrics | Max >> Median（Duration / Shuffle Read） |
-| GC Time | Stage detail → Tasks → GC Time | hot_key task GC time 顯著偏高 |
+| Stage Duration | Stages tab → Stage 0 (GroupBy) | 佔整體執行時間 94.3% |
+| Task Duration 分佈 | Stage detail → Tasks | Task 0/1: ~534s vs Task 2/3: ~10s（53x 差距）|
+| Shuffle Read Size | Stage detail → Tasks → Shuffle Read | Task 0/1 各 ~2.475 億筆 vs Task 2/3 各 ~250 萬筆 |
+| Data Skew 比 | Summary Metrics | 100:1（hot_key vs normal keys）|
+| GC Time | Stage detail → Tasks → GC Time | Task 0/1 GC 開銷 5-8%（正常範圍）|
+| Shuffle Spill | Stage detail → Tasks → Spill | 0 bytes（記憶體充足，無溢出）|
+| Executor 閒置 | Executors tab | 浪費的 Executor 時間 ~1,068 秒 |
+
+## 關鍵指標摘要
+
+| 指標 | 數值 | 嚴重程度 |
+|------|------|----------|
+| 數據傾斜比 | 100:1 | 🔴 極端 |
+| 任務時長傾斜 | 53.5x | 🔴 極端 |
+| 浪費的 Executor 時間 | 1,068 秒 | 🔴 嚴重 |
+| GC 開銷 | 5-8% | 🟢 正常 |
+| Shuffle 溢出 | 0 bytes | 🟢 優秀 |
+| 任務失敗/重試 | 0 | 🟢 正常 |
 
 ## 測試 Prompt
 
-> My Spark job "DataskewDemo" on EMR cluster **j-XXXXX** completed but took much longer than expected. The job is a simple groupBy aggregation on 500 million records. I noticed one task in the shuffle stage took significantly longer than others. Help me diagnose.
+> My Spark job "DataskewDemo" on EMR cluster **j-XXXXX** completed but took 9.4 minutes for a simple groupBy aggregation on 500 million records. I noticed some tasks in the shuffle stage took significantly longer than others. Help me diagnose.
 
 ## 預期 DevOps Agent 應能
 
 1. 識別 cluster 配置（1 Primary + 3 Core, m7g.2xlarge）和 Spark 設定
-2. 透過 Spark History Server / step logs 發現 task duration 分佈不均
-3. 識別 data skew — `hot_key` 佔 99% 資料量，導致單一 partition 過載
+2. 透過 Spark History Server / event log 發現 task duration 分佈不均（534s vs 10s）
+3. 識別 data skew — `hot_key` 佔 99% 資料量，導致 Task 0/1 過載
 4. 發現 AQE 被關閉（`spark.sql.adaptive.enabled=false`）是關鍵因素
 5. 發現 `shuffle.partitions=10` 過少，加劇 skew 影響
-6. 建議修復方案：
-   - **啟用 AQE**：`spark.sql.adaptive.enabled=true` + `spark.sql.adaptive.skewJoin.enabled=true`
-   - **增加 shuffle partitions**：`spark.sql.shuffle.partitions=200` 或更高
-   - **Salting 技巧**：對 hot key 加 random suffix 打散分佈
-   - **Two-phase aggregation**：先 partial agg 再 final agg
-   - **Broadcast join**（如適用）：小表 broadcast 避免 shuffle
+6. 確認集群本身健康（無 OOM、無 spill、GC 正常、無網路瓶頸）
+7. 建議修復方案（含預期效果）：
+
+| 優化方案 | 預計耗時 | 速度提升 |
+|----------|----------|----------|
+| 當前（無優化） | 566 秒 | 基準 |
+| 啟用 AQE | ~300 秒 | 1.9x |
+| AQE + 200 分區 | ~180 秒 | 3.1x |
+| AQE + 200 分區 + Salting | ~125 秒 | 4.5x ✨ |
+
+具體建議：
+- **啟用 AQE**：`spark.sql.adaptive.enabled=true` + `spark.sql.adaptive.skewJoin.enabled=true` + `spark.sql.adaptive.coalescePartitions.enabled=true`
+- **增加 shuffle partitions**：`spark.sql.shuffle.partitions=200`（當前僅 10）
+- **Salting 技巧**：對 hot key 加 random suffix 打散到多個 partition，先 partial agg 再 final agg
+- **Two-phase aggregation**：先按 salted key 聚合，再合併回原始 key
 
 ---
 
